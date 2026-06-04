@@ -1,0 +1,158 @@
+---
+# ──────────────────────────────────────────────────────────────────────
+# Ansible Playbook: Provision Flask App Server
+# Usage: ansible-playbook -i inventory.ini playbook.yml
+# ──────────────────────────────────────────────────────────────────────
+
+- name: 🚀 Setup Flask Cloud Server
+  hosts: flask_servers
+  become: yes
+
+  vars:
+    docker_image: "ghcr.io/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME:latest"
+    app_port: 5000
+    domain_name: "yourdomain.com"          # or use EC2 public IP
+    use_ssl: false                          # set true after DNS is pointed
+
+  tasks:
+
+    # ── System Update ──────────────────────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - python3-pip
+        state: present
+
+    # ── Docker ──────────────────────────────────────────────────────────
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      apt_repository:
+        repo: >
+          deb [arch=amd64]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        state: present
+        update_cache: yes
+
+    - name: Install Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+
+    - name: Start and enable Docker service
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    # ── Nginx ───────────────────────────────────────────────────────────
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Start and enable Nginx
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    # ── Certbot (SSL) ───────────────────────────────────────────────────
+    - name: Install Certbot and Nginx plugin
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    # ── Nginx Configuration ─────────────────────────────────────────────
+    - name: Copy Nginx reverse proxy config
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/sites-available/flask-app
+        mode: "0644"
+
+    - name: Enable flask-app site
+      file:
+        src: /etc/nginx/sites-available/flask-app
+        dest: /etc/nginx/sites-enabled/flask-app
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Validate Nginx configuration
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Reload Nginx
+      systemd:
+        name: nginx
+        state: reloaded
+      when: nginx_test.rc == 0
+
+    # ── Obtain SSL Certificate ──────────────────────────────────────────
+    - name: Obtain SSL certificate with Certbot
+      command: >
+        certbot --nginx
+        -d {{ domain_name }}
+        --non-interactive
+        --agree-tos
+        --email admin@{{ domain_name }}
+        --redirect
+      when: use_ssl | bool
+      register: certbot_result
+      changed_when: certbot_result.rc == 0
+
+    # ── Deploy Docker Container ─────────────────────────────────────────
+    - name: Pull Docker image
+      community.docker.docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+      ignore_errors: yes
+
+    - name: Run Flask container
+      community.docker.docker_container:
+        name: flask-app
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: unless-stopped
+        ports:
+          - "{{ app_port }}:{{ app_port }}"
+
+    - name: Verify container is running
+      command: docker ps --filter name=flask-app --format "table {{ '{{' }}.Names{{ '}}' }}\t{{ '{{' }}.Status{{ '}}' }}"
+      register: container_status
+      changed_when: false
+
+    - name: Print container status
+      debug:
+        msg: "{{ container_status.stdout }}"

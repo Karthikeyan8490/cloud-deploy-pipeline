@@ -1,0 +1,101 @@
+stages:
+  - build
+  - test
+  - deploy
+  - verify
+
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  DOCKER_LATEST: $CI_REGISTRY_IMAGE:latest
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# ──────────────────────────────────────
+# STAGE 1 — Build & Push Docker Image
+# ──────────────────────────────────────
+build-image:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - echo "🐳 Building Docker image..."
+    - docker build -t $DOCKER_IMAGE -t $DOCKER_LATEST .
+    - docker push $DOCKER_IMAGE
+    - docker push $DOCKER_LATEST
+    - echo "✅ Image pushed → $DOCKER_IMAGE"
+  only:
+    - main
+
+# ──────────────────────────────────────
+# STAGE 2 — Run Tests
+# ──────────────────────────────────────
+run-tests:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - pip install -r app/requirements.txt
+    - |
+      if [ -d "app/tests" ]; then
+        pip install pytest
+        python -m pytest app/tests/ -v
+      else
+        echo "⚠️  No tests directory found — skipping"
+      fi
+  only:
+    - main
+
+# ──────────────────────────────────────
+# STAGE 3 — Deploy to EC2
+# ──────────────────────────────────────
+deploy-production:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client curl
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh ubuntu@$EC2_HOST "
+        docker pull $DOCKER_LATEST && \
+        docker stop flask-app 2>/dev/null || true && \
+        docker rm flask-app 2>/dev/null || true && \
+        docker run -d \
+          --name flask-app \
+          -p 5000:5000 \
+          --restart unless-stopped \
+          $DOCKER_LATEST && \
+        docker image prune -f && \
+        echo '✅ Deployed successfully'
+      "
+  environment:
+    name: production
+    url: http://$EC2_HOST
+  only:
+    - main
+
+# ──────────────────────────────────────
+# STAGE 4 — Health Check
+# ──────────────────────────────────────
+health-check:
+  stage: verify
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - sleep 10
+    - |
+      STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://$EC2_HOST/health)
+      if [ "$STATUS" = "200" ]; then
+        echo "✅ Health check passed (HTTP $STATUS)"
+      else
+        echo "❌ Health check failed (HTTP $STATUS)"
+        exit 1
+      fi
+  only:
+    - main
